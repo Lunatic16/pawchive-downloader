@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# pawdl downloads and local state
+pawdl_downloads/
+*.part
+
+# pawdl config (contains your User-Agent / local paths)
+.config/pawdl/
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.idea/
+.vscode/
+*.swp
