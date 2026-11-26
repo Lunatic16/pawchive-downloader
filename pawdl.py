@@ -22,6 +22,7 @@ Python 3.8+, standard library only.
 import concurrent.futures
 import datetime
 import html as htmllib
+import http.client
 import json
 import os
 import re
@@ -82,16 +83,33 @@ def load_config():
     cfg = dict(DEFAULT_CONFIG)
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
-            cfg.update(json.load(fh))
+            stored = json.load(fh)
+        if isinstance(stored, dict):
+            cfg.update(stored)
     except (OSError, ValueError):
         pass
+    # a hand-edited config must not crash the program later on
+    for key, minimum in (("creators_cache_hours", 1), ("max_retries", 0)):
+        try:
+            cfg[key] = max(minimum, int(cfg[key]))
+        except (TypeError, ValueError):
+            cfg[key] = DEFAULT_CONFIG[key]
+    for key in ("user_agent", "download_dir"):
+        if not isinstance(cfg[key], str):
+            cfg[key] = DEFAULT_CONFIG[key]
     return cfg
+
+
+def write_json_atomic(path, data, indent=None):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=indent, ensure_ascii=False)
+    os.replace(tmp, path)
 
 
 def save_config(cfg):
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, indent=2, ensure_ascii=False)
+    write_json_atomic(CONFIG_FILE, cfg, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +143,7 @@ def _detect_color():
 
 def _detect_unicode():
     try:
-        "\u2500\u256d\u256e\u2502\u2570\u256f\u2588\u2714".encode(
+        "\u2500\u256d\u256e\u2502\u2570\u256f\u2588\u2591\u2714\u203a\u00b7".encode(
             getattr(sys.stdout, "encoding", "") or "ascii")
         return True
     except (UnicodeEncodeError, LookupError):
@@ -136,7 +154,8 @@ COLOR = _detect_color()
 UNICODE = _detect_unicode()
 
 # palette (SGR codes)
-DIM = "90"          # grey details
+DIM = "37"          # light grey - secondary details
+PROMPT = "1;97"     # bold bright white - input prompts
 ACCENT = "1;96"     # bold bright cyan - titles
 ACCENT2 = "1;95"    # bold bright magenta - numbers / keys
 GOOD = "92"         # green - success
@@ -171,12 +190,14 @@ if UNICODE:
     R_H = "\u2500"                                        # ─
     BAR_FULL, BAR_REST = "\u2588", "\u2591"               # █ ░
     SYM_OK, SYM_INFO = "\u2714", "\u203a"                 # ✔ ›
+    SYM_ASK, SYM_DOT = "\u203a", "\u00b7"                 # › ·
 else:
     R_TL = R_TR = R_BL = R_BR = "+"
     R_MID = "|"
     R_H = "-"
     BAR_FULL, BAR_REST = "#", "."
     SYM_OK, SYM_INFO = "+", ">"
+    SYM_ASK, SYM_DOT = ">", "-"
 
 
 def cls():
@@ -213,14 +234,29 @@ def ask(prompt, default=None):
         suffix = c(" [%s]" % default, DIM)
     try:
         val = input("  %s %s%s%s " % (
-            c("?", ACCENT2), c(prompt, "36"), suffix, c("\u203a", DIM))).strip()
+            c("?", ACCENT2), c(prompt, PROMPT), suffix, c(SYM_ASK, DIM))).strip()
     except EOFError:
         return default
     return val or default
 
 
+_CONSOLE_LOCK = threading.RLock()
+_progress_len = 0          # width of the progress line currently on screen
+
+
+def clear_progress():
+    global _progress_len
+    with _CONSOLE_LOCK:
+        if _progress_len:
+            sys.stdout.write("\r" + " " * _progress_len + "\r")
+            sys.stdout.flush()
+            _progress_len = 0
+
+
 def warn(msg):
-    print("  %s %s" % (c("!", WARNC), c(msg, WARNC)))
+    with _CONSOLE_LOCK:
+        clear_progress()
+        print("  %s %s" % (c("!", WARNC), c(msg, WARNC)))
 
 
 def info(msg):
@@ -229,6 +265,21 @@ def info(msg):
 
 def ok(msg):
     print("  %s %s" % (c(SYM_OK, GOOD), c(msg, GOOD)))
+
+
+def pause():
+    try:
+        input("\n  %s " % c("press Enter to continue", DIM))
+    except EOFError:
+        pass
+
+
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+
+def printable(text):
+    """Remote text made safe for the terminal (no control/escape codes)."""
+    return _CTRL_RE.sub(" ", htmllib.unescape(str(text or ""))).strip()
 
 
 def onoff(v):
@@ -242,12 +293,30 @@ def onoff(v):
 _SAFE_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-def sanitize(name, fallback="untitled", maxlen=120):
-    name = htmllib.unescape(name or "").strip()
+_WIN_RESERVED = re.compile(r"^(con|prn|aux|nul|com\d|lpt\d)(\..*)?$", re.I)
+
+
+def _clip_bytes(text, maxbytes):
+    return text.encode("utf-8", "ignore")[:maxbytes].decode("utf-8", "ignore")
+
+
+def sanitize(name, fallback="untitled", maxlen=120, maxbytes=240,
+             keep_ext=False):
+    """Make a safe path component. Linux limits names to 255 *bytes*, so
+    long non-Latin names are clipped by encoded size as well as length."""
+    name = htmllib.unescape(str(name or "")).strip()
     name = _SAFE_RE.sub("_", name)
+    name = name.encode("utf-8", "replace").decode("utf-8")   # lone surrogates
     name = re.sub(r"\s+", " ", name).strip(" .")
-    if len(name) > maxlen:
-        name = name[:maxlen].rstrip(" .")
+    if len(name) > maxlen or len(name.encode("utf-8")) > maxbytes:
+        root, ext = os.path.splitext(name) if keep_ext else (name, "")
+        if len(ext) > 16:
+            root, ext = name, ""
+        root = _clip_bytes(root[:maxlen - len(ext)],
+                           maxbytes - len(ext.encode("utf-8")))
+        name = root.rstrip(" .") + ext
+    if os.name == "nt" and _WIN_RESERVED.match(name):
+        name = "_" + name
     return name or fallback
 
 
@@ -330,7 +399,7 @@ class HttpClient:
         return {"User-Agent": self.user_agent}
 
     def _should_retry(self, code):
-        return code in (403, 408, 425, 429, 500, 502, 503, 504)
+        return code in (403, 408, 425, 429) or code >= 500
 
     def _backoff(self, attempt, code, body=""):
         # the file server answers 403 with an etiquette message when the
@@ -355,14 +424,15 @@ class HttpClient:
                     body = e.read().decode("utf-8", "replace")[:300]
                 except Exception:
                     pass
-                if e.code in (400, 404):
+                if not self._should_retry(e.code):
                     raise HttpError("HTTP %s: %s" % (e.code, body.strip()))
                 last_err = HttpError("HTTP %s: %s" % (e.code, body.strip()))
                 if attempt < self.max_retries:
                     d = self._backoff(attempt, e.code, body)
                     warn("HTTP %s on %s - retrying in %ds" % (e.code, url, d))
                     time.sleep(d)
-            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            except (urllib.error.URLError, http.client.HTTPException,
+                    OSError) as e:
                 last_err = HttpError(str(e))
                 if attempt < self.max_retries:
                     d = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
@@ -372,22 +442,34 @@ class HttpClient:
                 raise HttpError("invalid JSON from %s: %s" % (url, e))
         raise last_err or HttpError("request failed: %s" % url)
 
-    def download_to_file(self, url, dest_path, progress_cb=None):
+    def download_to_file(self, url, dest_path, progress_cb=None, cancel=None):
         """Stream a file to dest_path. Returns (status, bytes_written).
-        status in {'downloaded', 'skipped', 'failed'}."""
+        status in {'downloaded', 'skipped', 'failed', 'cancelled'}."""
+        cancel = cancel or threading.Event()
         tmp = dest_path + ".part"
+
+        def discard_partial():
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
             return ("skipped", os.path.getsize(dest_path))
-        last_err = None
         for attempt in range(self.max_retries + 1):
+            if cancel.is_set():
+                return ("cancelled", 0)
             self.file_limiter.wait()
+            if cancel.is_set():
+                return ("cancelled", 0)
             try:
                 os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
             except OSError as e:
                 warn("cannot create directory for %s: %s" % (dest_path, e))
                 return ("failed", 0)
-            req = urllib.request.Request(url, headers=self._opener_headers())
             try:
+                req = urllib.request.Request(url,
+                                             headers=self._opener_headers())
                 total = None
                 with urllib.request.urlopen(req, timeout=90) as resp:
                     cl = resp.headers.get("Content-Length")
@@ -403,21 +485,22 @@ class HttpClient:
                             got += len(chunk)
                             if progress_cb:
                                 progress_cb(got, total)
-                if os.path.getsize(tmp) == 0:
+                # a dropped connection just ends the stream: verify the size,
+                # or a truncated file would be kept and skipped forever
+                if total is not None and got != total:
+                    raise HttpError("incomplete download (%d of %d bytes)"
+                                    % (got, total))
+                if got == 0:
                     raise HttpError("empty response body")
                 os.replace(tmp, dest_path)
-                return ("downloaded", os.path.getsize(dest_path))
+                return ("downloaded", got)
             except DownloadCancelled:
                 # user abort: drop the useless partial (server has no Range
                 # support, so .part files cannot be resumed)
-                if os.path.exists(tmp):
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
+                discard_partial()
                 return ("cancelled", 0)
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError,
-                    ConnectionError, OSError, HttpError) as e:
+            except (urllib.error.URLError, http.client.HTTPException,
+                    OSError, ValueError, HttpError) as e:
                 code = getattr(e, "code", None)
                 body = ""
                 if code:
@@ -425,20 +508,19 @@ class HttpClient:
                         body = e.read().decode("utf-8", "replace")[:300]
                     except Exception:
                         pass
-                last_err = e
-                if os.path.exists(tmp):
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
-                if code in (400, 404):
+                discard_partial()
+                name = os.path.basename(dest_path)
+                if code and not self._should_retry(code):
                     warn("HTTP %s for %s - file not available "
-                         "(may be a dead preview URL)" % (code, url))
+                         "(dead or expired URL)" % (code, name))
                     return ("failed", 0)
-                if attempt < self.max_retries:
+                if attempt >= self.max_retries:
+                    warn("giving up on %s: %s" % (name, e))
+                else:
                     d = self._backoff(attempt, code or 0, body)
                     warn("download error (%s) - retrying in %ds" % (e, d))
-                    time.sleep(d)
+                    if cancel.wait(d):
+                        return ("cancelled", 0)
         return ("failed", 0)
 
 
@@ -485,8 +567,7 @@ def parse_post_url(text):
     """Accept a full post URL like
     https://pawchive.pw/patreon/user/436247/post/176350173
     or the shorthand  patreon/user/436247/post/176350173."""
-    text = text.strip()
-    m = re.search(r"([a-z]+)/user/(\S+)/post/(\w+)", text)
+    m = re.search(r"([a-z]+)/user/([^/?#\s]+)/post/([^/?#\s]+)", text or "")
     if m:
         return m.group(1), m.group(2), m.group(3)
     return None
@@ -499,11 +580,14 @@ def file_url(item):
     if not path:
         return None
     name = item.get("name") or path.rsplit("/", 1)[-1]
-    return "%s/data%s?f=%s" % (server, path, urllib.parse.quote(name))
+    if not path.startswith("/"):
+        path = "/" + path
+    return "%s/data%s?f=%s" % (server, urllib.parse.quote(path, safe="/%"),
+                               urllib.parse.quote(name, safe=""))
 
 
 _THUMB_RE = re.compile(r"^https://img\.pawchive\.pw/thumbnail(/data/.+)$")
-_IMG_RE = re.compile(r"<img[^>]*?src=[\"']([^\"']+)[\"']", re.I)
+_IMG_RE = re.compile(r"<img\b[^>]*?\ssrc\s*=\s*([\"'])(.*?)\1", re.I | re.S)
 
 
 def inline_image_urls(post):
@@ -511,58 +595,84 @@ def inline_image_urls(post):
     content = post.get("content") or ""
     urls = []
     seen = set()
-    for src in _IMG_RE.findall(content):
+    for _, src in _IMG_RE.findall(content):
         src = htmllib.unescape(src.strip())
+        if src.startswith("//"):
+            src = "https:" + src
         m = _THUMB_RE.match(src)
         if m:
             src = FALLBACK_FILE_SERVER + m.group(1)
         elif src.startswith("/data/"):
             src = FALLBACK_FILE_SERVER + src
-        if "/data/" in src and "pawchive.pw" in src and src not in seen:
+        src = urllib.parse.quote(src, safe=":/?&=%#+,;@!$'()*[]~")
+        parts = urllib.parse.urlsplit(src)
+        host = parts.hostname or ""
+        if ("/data/" in parts.path and src not in seen
+                and (host == "pawchive.pw" or host.endswith(".pawchive.pw"))):
             seen.add(src)
             urls.append(src)
     return urls
 
 
-def collect_post_files(post, include_previews=False):
+# names written by write_post_metadata (plus our marker): attachments must
+# not use them, or they would be skipped as "already downloaded"
+RESERVED_NAMES = ("post.json", "post.md", "content.txt", ".pawdl_post_id")
+
+
+def collect_post_files(post, include_previews=False, include_inline=True):
     """Return an ordered list of (url, filename) for one post.
 
     Handles three file kinds:
       * regular path-based files/attachments ({server}/data{path}?f=name),
       * deferred attachments (videos) that only carry a signed temporary
         download URL (temp_download_url, expires after temp_expires),
-      * inline images inside the post HTML body.
+      * inline images inside the post HTML body (if include_inline).
     Files marked preview_only (e.g. thumbnail.jpg) are skipped unless
     include_previews is set - they are preview placeholders, not content,
     and their data URLs are frequently dead (nginx 404).
+    A file referenced more than once is only downloaded once.
     """
     files = []
-    used_names = set()
+    fold = str.casefold if os.name == "nt" or sys.platform == "darwin" else str
+    used_names = {fold(n) for n in RESERVED_NAMES}
+    seen_sources = set()
 
-    def add(url, name):
+    def add(url, name, source):
         if not url or not name:
             return
-        base = sanitize(name, "file", 100)
+        base = sanitize(name, "file", 100, 230, keep_ext=True)
         i, cand = 2, base
-        while cand in used_names:
+        while fold(cand) in used_names:
             root, ext = os.path.splitext(base)
             cand = "%s (%d)%s" % (root, i, ext)
             i += 1
-        used_names.add(cand)
-        files.append((url, cand))
+        # a duplicate still reserves its name slot, so that the numbering of
+        # later files matches what earlier versions already saved to disk
+        used_names.add(fold(cand))
+        if source not in seen_sources:
+            seen_sources.add(source)
+            files.append((url, cand))
 
-    f = post.get("file") or {}
-    if f.get("path") and (include_previews or not f.get("preview_only")):
-        add(file_url(f), f.get("name") or f["path"].rsplit("/", 1)[-1])
+    def add_item(item):
+        if item.get("preview_only") and not include_previews:
+            return
+        if item.get("deferred"):
+            url = item.get("temp_download_url") or item.get("temp_url")
+            add(url, item.get("name") or "video.mp4", url)
+        elif item.get("path"):
+            add(file_url(item),
+                item.get("name") or item["path"].rsplit("/", 1)[-1],
+                "/" + item["path"].lstrip("/"))
+
+    add_item(post.get("file") or {})
     for att in post.get("attachments") or []:
-        if att.get("deferred"):
-            url = att.get("temp_download_url") or att.get("temp_url")
-            add(url, att.get("name") or "video.mp4")
-        elif att.get("path"):
-            add(file_url(att), att.get("name") or att["path"].rsplit("/", 1)[-1])
-    for url in inline_image_urls(post):
-        name = url.split("?")[0].rsplit("/", 1)[-1] or "inline_image"
-        add(url, name)
+        add_item(att)
+    if include_inline:
+        for url in inline_image_urls(post):
+            path = urllib.parse.urlsplit(url).path
+            name = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+            add(url, name or "inline_image",
+                urllib.parse.unquote(path[path.index("/data/") + 5:]))
     return files
 
 
@@ -577,13 +687,13 @@ _BLOCK_TAGS = ("p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5",
 def html_to_text(content):
     if not content:
         return ""
-    s = content
+    s = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1>", "", content)
     s = re.sub(r"(?i)<br\s*/?>", "\n", s)
     for t in _BLOCK_TAGS:
-        s = re.sub(r"(?i)</?%s[^>]*>" % t, "\n", s)
-    s = re.sub(r"(?i)<img[^>]*?alt=[\"']([^\"']*)[\"'][^>]*>", r"[image: \1]", s)
+        s = re.sub(r"(?i)</?%s\b[^>]*>" % t, "\n", s)
+    s = re.sub(r"(?i)<img\b[^>]*?\salt=([\"'])((?:(?!\1)[^>])+)\1[^>]*>",
+               r"[image: \2]", s)
     s = re.sub(r"(?i)<img[^>]*>", "[image]", s)
-    s = re.sub(r"(?i)<(script|style)[^>]*>.*?</\1>", "", s, flags=re.S)
     s = re.sub(r"<[^>]+>", "", s)
     s = htmllib.unescape(s)
     s = re.sub(r"[ \t]+", " ", s)
@@ -601,7 +711,7 @@ class DownloadStats:
         self.lock = threading.RLock()
         self.done = 0
         self.total = 0
-        self.bytes_ok = 0      # finished files
+        self.bytes_ok = 0      # bytes of files downloaded in this run
         self.bytes_now = 0     # in-flight bytes (streaming)
         self.downloaded = 0
         self.skipped = 0
@@ -612,7 +722,6 @@ class DownloadStats:
         self.speed = 0.0          # bytes per second (smoothed)
         self._speed_t0 = None
         self._speed_b0 = 0
-        self._last_len = 0        # visible length of the last progress line
 
     def add_total(self, n):
         with self.lock:
@@ -625,7 +734,6 @@ class DownloadStats:
                 self.bytes_ok += size
             elif status == "skipped":
                 self.skipped += 1
-                self.bytes_ok += size
             elif status == "cancelled":
                 self.cancelled += 1
             else:
@@ -634,7 +742,8 @@ class DownloadStats:
             self.done += 1
 
     def draw(self):
-        with self.lock:
+        global _progress_len
+        with self.lock, _CONSOLE_LOCK:
             now = time.time()
             total_b = self.bytes_ok + self.bytes_now
             if self._speed_t0 is None:
@@ -656,17 +765,18 @@ class DownloadStats:
                 msg += "  " + c("%d failed" % self.failed, BAD)
             if self.cancelled:
                 msg += "  " + c("%d cancelled" % self.cancelled, WARNC)
+            # a line wider than the terminal wraps and cannot be redrawn
+            if vlen(msg) >= term_width():
+                msg = "  %3.0f%%  %d/%d" % (frac * 100, self.done, self.total)
             vis = vlen(msg)
-            if vis < self._last_len:
-                msg += " " * (self._last_len - vis)
-            self._last_len = vis
-            sys.stdout.write("\r" + msg)
+            pad = " " * max(_progress_len - vis, 0)
+            sys.stdout.write("\r" + msg + pad)
             sys.stdout.flush()
+            _progress_len = vis
 
     def finish_line(self):
         with self.lock:
-            sys.stdout.write("\r" + " " * (self._last_len + 2) + "\r")
-            sys.stdout.flush()
+            clear_progress()
             parts = [c("%d downloaded" % self.downloaded, GOOD)
                      + c(" (%s)" % fmt_size(self.bytes_ok), DIM),
                      c("%d skipped" % self.skipped, ACCENT)]
@@ -677,13 +787,20 @@ class DownloadStats:
             print("  %s %s" % (c(SYM_OK, GOOD), ", ".join(parts)))
             for name in self.failed_names[:10]:
                 warn("failed: %s" % name)
+            if len(self.failed_names) > 10:
+                warn("... and %d more" % (len(self.failed_names) - 10))
 
 
 class Downloader:
-    def __init__(self, http, stats):
+    def __init__(self, http):
         self.http = http
-        self.stats = stats
+        self.stats = DownloadStats()
         self._cancel = threading.Event()
+
+    def reset(self):
+        """Start counting from zero for a new download session."""
+        self.stats = DownloadStats()
+        self._cancel.clear()
 
     def _worker(self, url, dest):
         last = [0]
@@ -702,40 +819,43 @@ class Downloader:
                     self.stats._printed = now
                     self.stats.draw()
         try:
-            status, size = self.http.download_to_file(url, dest, cb)
-        except DownloadCancelled:
-            status, size = "cancelled", 0
-            warn("cancelled: %s" % name)
+            status, size = self.http.download_to_file(url, dest, cb,
+                                                      self._cancel)
         except Exception as e:  # defensive: never kill the pool
             status, size = "failed", 0
             warn("exception downloading %s: %s" % (url, e))
         with self.stats.lock:
             self.stats.bytes_now -= last[0]
             last[0] = 0
-        self.stats.update(status, name, size)
+            self.stats.update(status, name, size)
         self.stats.draw()
 
     def run(self, jobs):
-        """jobs: list of (url, absolute_dest_path)."""
+        """jobs: list of (url, absolute_dest_path).
+        Returns False if the user interrupted the run."""
         if not jobs:
-            info("nothing to download")
-            return
+            return True
         self.stats.add_total(len(jobs))
-        self._cancel.clear()
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=MAX_WORKERS) as pool:
-            futures = [pool.submit(self._worker, url, dest)
-                       for url, dest in jobs]
-            try:
-                for f in concurrent.futures.as_completed(futures):
-                    pass
-            except KeyboardInterrupt:
-                warn("interrupted - aborting downloads (partials are "
-                     "discarded: the server cannot resume them)...")
-                self._cancel.set()
-                for f in futures:
-                    f.cancel()
-        self.stats.finish_line()
+        interrupted = False
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        futures = []
+        try:
+            for url, dest in jobs:
+                futures.append(pool.submit(self._worker, url, dest))
+            pending = set(futures)
+            while pending:   # short timeouts keep Ctrl+C responsive
+                _, pending = concurrent.futures.wait(pending, timeout=0.5)
+        except KeyboardInterrupt:
+            interrupted = True
+            self._cancel.set()
+            warn("interrupted - aborting downloads (partials are "
+                 "discarded: the server cannot resume them)...")
+            for f in futures:
+                if f.cancel():
+                    self.stats.update("cancelled", "", 0)
+        finally:
+            pool.shutdown(wait=True)
+        return not interrupted
 
 
 # ---------------------------------------------------------------------------
@@ -746,15 +866,59 @@ def post_dir_path(cfg, post, creator_name=None):
     dd = cfg["download_dir"]
     service = post.get("service", "?")
     user = post.get("user", "?")
-    cname = sanitize(creator_name or user, str(user), 60)
+    cname = sanitize(creator_name or user, str(user), 60, 200)
     published = post.get("published") or post.get("added") or ""
-    date = str(published)[:10] or "unknown-date"
+    date = sanitize(str(published)[:10], "unknown-date")
     title = sanitize(post.get("title"), "untitled", 80)
     folder = "%s_%s" % (date, title)
-    return os.path.join(dd, service, "%s (%s)" % (cname, user), folder)
+    return os.path.join(dd, sanitize(service, "unknown"),
+                        "%s (%s)" % (cname, sanitize(user, "unknown", 60)),
+                        folder)
+
+
+POST_MARKER = ".pawdl_post_id"
+
+
+def folder_owner(path):
+    """ID of the post stored in `path`, or None if it cannot be told."""
+    try:
+        with open(os.path.join(path, POST_MARKER), encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except (OSError, ValueError):
+        pass
+    # folders written by earlier versions only have the metadata files
+    try:
+        with open(os.path.join(path, "post.json"), encoding="utf-8") as fh:
+            return str(json.load(fh)["id"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        with open(os.path.join(path, "post.md"), encoding="utf-8") as fh:
+            m = re.search(r"^- \*\*Post ID\*\*: (.+)$", fh.read(), re.M)
+            return m.group(1).strip() if m else None
+    except (OSError, ValueError):
+        return None
+
+
+def claim_post_dir(cfg, post, creator_name=None):
+    """Create and return the folder of a post. Two posts with the same date
+    and title must not share one, so the later one gets its ID appended."""
+    base = post_dir_path(cfg, post, creator_name)
+    pid = str(post.get("id"))
+    dest = base
+    if folder_owner(base) not in (None, pid):
+        parent, leaf = os.path.split(base)
+        suffix = "_" + sanitize(pid, "post", 40, 40)
+        dest = os.path.join(parent, _clip_bytes(leaf, 250 - len(
+            suffix.encode("utf-8"))) + suffix)
+    os.makedirs(dest, exist_ok=True)
+    with open(os.path.join(dest, POST_MARKER), "w", encoding="utf-8") as fh:
+        fh.write(pid + "\n")
+    return dest
 
 
 def write_post_metadata(cfg, post, dest_dir, creator_name=None):
+    """Write the metadata files that are enabled in the settings."""
     os.makedirs(dest_dir, exist_ok=True)
 
     if cfg.get("save_post_json"):
@@ -773,7 +937,7 @@ def write_post_metadata(cfg, post, dest_dir, creator_name=None):
         rows = []
         f = post.get("file") or {}
         if f.get("name"):
-            if f.get("preview_only"):
+            if f.get("preview_only") and not cfg.get("download_preview_files"):
                 rows.append("- %s (preview only, not archived)" % f["name"])
             else:
                 rows.append("- %s" % f["name"])
@@ -791,8 +955,9 @@ def write_post_metadata(cfg, post, dest_dir, creator_name=None):
             "- **Creator**: %s (%s)" % (creator_name or "?", post.get("user")),
             "- **Post ID**: %s" % post.get("id"),
             "- **Published**: %s" % (post.get("published") or "?"),
-            "- **URL**: %s/patreon/user/%s/post/%s" % (
-                SITE_BASE, post.get("user"), post.get("id")),
+            "- **URL**: %s/%s/user/%s/post/%s" % (
+                SITE_BASE, post.get("service"), post.get("user"),
+                post.get("id")),
         ]
         tags = post.get("tags")
         if tags:
@@ -810,6 +975,12 @@ def write_post_metadata(cfg, post, dest_dir, creator_name=None):
             fh.write("\n".join(lines) + "\n")
 
 
+def post_files(cfg, post):
+    """collect_post_files() with the user's settings applied."""
+    return collect_post_files(post, cfg.get("download_preview_files"),
+                              cfg.get("download_inline_images"))
+
+
 def build_post_jobs(cfg, post, creator_name=None):
     """Return (dest_dir, [(url, dest), ...]) for one full post.
 
@@ -817,10 +988,9 @@ def build_post_jobs(cfg, post, creator_name=None):
     skip-if-exists logic works on re-runs. Same-post name collisions are
     already resolved inside collect_post_files().
     """
-    dest = post_dir_path(cfg, post, creator_name)
-    jobs = []
-    for url, name in collect_post_files(post, cfg.get("download_preview_files")):
-        jobs.append((url, os.path.join(dest, name)))
+    dest = claim_post_dir(cfg, post, creator_name)
+    jobs = [(url, os.path.join(dest, name))
+            for url, name in post_files(cfg, post)]
     return dest, jobs
 
 
@@ -841,37 +1011,54 @@ class CreatorCache:
         except OSError:
             return False
 
+    def _read(self):
+        try:
+            with open(CREATORS_CACHE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, list) else None
+
     def get(self, force=False):
-        if self._data and not force:
+        if self._data and not force and self._fresh(CREATORS_CACHE):
             return self._data
         if not force and self._fresh(CREATORS_CACHE):
-            try:
-                with open(CREATORS_CACHE, "r", encoding="utf-8") as fh:
-                    self._data = json.load(fh)
+            self._data = self._read()
+            if self._data:
                 return self._data
-            except (OSError, ValueError):
-                pass
-        info("downloading creator index (~16 MB, one-time, then cached)...")
-        data = self.api.creators()
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(CREATORS_CACHE, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False)
+        info("downloading creator index (~16 MB, then cached)...")
+        try:
+            data = self.api.creators()
+            if not isinstance(data, list):
+                raise HttpError("unexpected creator index format")
+        except HttpError as e:
+            stale = None if force else (self._data or self._read())
+            if not stale:
+                raise
+            warn("could not refresh creator index (%s) - using old copy" % e)
+            self._data = stale
+            return stale
         self._data = data
-        info("cached %d creators to %s" % (len(data), CREATORS_CACHE))
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            write_json_atomic(CREATORS_CACHE, data)
+            info("cached %d creators to %s" % (len(data), CREATORS_CACHE))
+        except OSError as e:
+            warn("could not save creator cache: %s" % e)
         return data
 
     def search(self, query, service=None, limit=60):
         data = self.get()
         q = query.lower().strip()
         out = []
-        for c in data:
-            if service and c.get("service") != service:
+        for cr in data:
+            if service and cr.get("service") != service:
                 continue
-            if q and q not in (c.get("name") or "").lower() \
-                    and q not in str(c.get("public_id") or "").lower() \
-                    and q not in str(c.get("id") or ""):
+            if q and q not in (cr.get("name") or "").lower() \
+                    and q not in str(cr.get("public_id") or "").lower() \
+                    and q not in str(cr.get("id") or "").lower():
                 continue
-            out.append(c)
+            out.append(cr)
             if len(out) >= limit:
                 break
         return out
@@ -900,201 +1087,270 @@ HELP_TEXT = """
     * max 5 parallel downloads, >= 1 second between file requests
       (the archive asks for this; abusing it gets your IP blocked),
     * already-downloaded files are skipped on re-run,
-    * 3 automatic retries with backoff on transient errors,
+    * automatic retries with backoff on transient errors,
     * every post is saved with post.json + post.md + content.txt metadata,
     * deferred video attachments (signed temporary MP4 URLs) are
       downloaded directly; the video server does not support resume,
       so an interrupted video restarts from the beginning next run,
     * inline <img> images inside post bodies are downloaded too
-      (preview-only thumbnails are skipped; toggle in Settings [8]).
+      (toggle in Settings [7]),
+    * preview-only thumbnails are skipped (toggle in Settings [8]).
 
   Folder layout:
     {download_dir}/{service}/{creator} ({id})/{date}_{title}/
       file1.png, file2.png, ..., post.json, post.md, content.txt
+    Posts sharing a date and title get _{post id} added to the folder name.
 """
 
 
-def display_post_row(i, p, creator_names=None):
-    title = sanitize(p.get("title") or "(untitled)", "(untitled)", 56)
+def display_post_row(i, p):
+    title = printable(p.get("title")) or "(untitled)"
+    title = title[:56]
     f = p.get("file") or {}
-    files = (1 if f.get("path") and not f.get("preview_only") else 0) \
-        + len(p.get("attachments") or [])
+    paths = set()
+    for item in [f] + list(p.get("attachments") or []):
+        if item.get("preview_only"):
+            continue
+        key = item.get("path") or (item.get("deferred") and item.get("name"))
+        if key:
+            paths.add(key)
     date = str(p.get("published") or "")[:10]
     print("  %s %s %s  %s  %s" % (
         c("%3d." % i, ACCENT2),
         c("[%s]" % p.get("service", "?"), DIM),
         c(str(p.get("user", "?")), DIM),
         title,
-        c("%s | %d file(s)" % (date or "?", files), ACCENT)))
+        c("%s | %d file(s)" % (date or "?", len(paths)), ACCENT)))
 
 
-def fetch_full_posts(api, summaries):
-    """Fetch full versions of the selected post summaries."""
-    posts = []
-    for p in summaries:
-        try:
-            posts.append(api.post(p["service"], p["user"], p["id"]))
-        except HttpError as e:
-            warn("could not fetch post %s: %s" % (p.get("id"), e))
-    return posts
+def creator_key(item, user_field="user"):
+    # numeric IDs can repeat between services, so key on both
+    return (item.get("service"), str(item.get(user_field)))
 
 
-def resolve_creator_names(api, cache, posts):
+def creator_label(cr):
+    return cr.get("name") or cr.get("public_id") or ""
+
+
+def resolve_creator_names(cache, posts):
     """Best-effort lookup of creator names from the cached creator index."""
+    wanted = {creator_key(p) for p in posts}
     names = {}
     try:
-        creators = cache.get()
-        index = {(c.get("service"), str(c.get("id"))):
-                 (c.get("name") or c.get("public_id") or "") for c in creators}
-        for p in posts:
-            key = (p.get("service"), str(p.get("user")))
-            if key in index and index[key]:
-                names[str(p.get("user"))] = index[key]
-    except HttpError:
-        pass
+        for cr in cache.get():
+            key = creator_key(cr, "id")
+            if key in wanted and creator_label(cr):
+                names[key] = creator_label(cr)
+    except (HttpError, OSError) as e:
+        warn("creator names unavailable (%s) - using IDs" % e)
     return names
 
 
+DOWNLOAD_BATCH = 10   # posts fetched per round; signed video URLs expire
+
+
 def download_posts(cfg, api, dl, posts, creator_names=None):
-    """Fetch full posts (if summaries), then download everything."""
-    if not posts:
+    """Download the selected posts, a batch at a time: fetch the full post,
+    save its metadata, download its files. Returns False if interrupted."""
+    unique, seen = [], set()
+    for p in posts:
+        key = (p.get("service"), str(p.get("user")), str(p.get("id")))
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    if not unique:
         info("nothing selected")
-        return
-    creator_names = dict(creator_names or {})
-    if any("content" not in p for p in posts):
-        posts = fetch_full_posts(api, posts)
-    missing = {str(p.get("user")) for p in posts
-               if str(p.get("user")) not in creator_names}
-    if missing and not creator_names:
-        creator_names.update(resolve_creator_names(api,
-                CreatorCache(cfg, api), posts))
-    all_jobs = []
-    for post in posts:
-        dest, jobs = build_post_jobs(cfg, post,
-                                     creator_names.get(str(post.get("user"))))
-        if cfg.get("save_post_json") or cfg.get("save_content_txt") \
-                or cfg.get("save_post_md"):
-            write_post_metadata(cfg, post, dest,
-                                creator_names.get(str(post.get("user"))))
-        all_jobs.extend(jobs)
-    if not all_jobs:
-        info("selected posts contain no downloadable files "
-             "(metadata still saved)")
-        return
-    head("downloading %d file(s) from %d post(s)"
-         % (len(all_jobs), len(posts)))
-    dl.run(all_jobs)
+        return True
+    names = dict(creator_names or {})
+    if any(creator_key(p) not in names for p in unique):
+        found = resolve_creator_names(CreatorCache(cfg, api), unique)
+        for key, name in found.items():
+            names.setdefault(key, name)
+
+    head("downloading %d post(s)" % len(unique))
+    dl.reset()
+    bad_posts, files = [], 0
+    completed = True
+    for start in range(0, len(unique), DOWNLOAD_BATCH):
+        jobs = []
+        for summary in unique[start:start + DOWNLOAD_BATCH]:
+            try:
+                # always fetch the full post: list entries may be truncated
+                # and signed video URLs must be fresh
+                post = summary if summary.get("_full") else api.post(
+                    summary["service"], summary["user"], summary["id"])
+                name = names.get(creator_key(summary))
+                dest, post_jobs = build_post_jobs(cfg, post, name)
+                write_post_metadata(
+                    cfg, {k: v for k, v in post.items() if k != "_full"},
+                    dest, name)
+                jobs.extend(post_jobs)
+            except (HttpError, OSError, KeyError, TypeError,
+                    AttributeError) as e:
+                warn("could not process post %s: %s" % (summary.get("id"), e))
+                bad_posts.append(summary.get("id"))
+        files += len(jobs)
+        if len(unique) > DOWNLOAD_BATCH:
+            info("posts %d-%d of %d: %d file(s)" % (
+                start + 1, min(start + DOWNLOAD_BATCH, len(unique)),
+                len(unique), len(jobs)))
+        if not dl.run(jobs):
+            completed = False
+            break
+        clear_progress()
+    if files:
+        dl.stats.finish_line()
+    elif len(bad_posts) < len(unique):
+        info("selected posts contain no downloadable files")
+    if bad_posts:
+        warn("%d post(s) could not be processed" % len(bad_posts))
+    return completed
 
 
 # --- 1. creator search ------------------------------------------------------
 
 def search_creators_menu(cfg, api, cache, dl):
     head("creator search")
-    query = ask("creator name / public_id / id (blank = browse all)")
+    query = ask("creator name / public_id / id (blank = browse)")
     service = ask("filter service: p=patreon, f=fanbox, blank=all")
-    service = {"p": "patreon", "f": "fanbox"}.get((service or "").lower(),
-                                                  service or None)
+    service = (service or "").lower()
+    service = {"p": "patreon", "f": "fanbox"}.get(service, service or None)
     results = cache.search(query or "", service)
     if not results:
         warn("no creators matched")
         return
     print("")
     for idx, cr in enumerate(results, 1):
-        name = (cr.get("name") or "?")[:40]
-        print("  %s %-9s %-40s %s  %s  %s" % (
+        # pad the plain text first: colour codes would upset the widths
+        print("  %s %s %-40s %s  %s  %s" % (
             c("%3d." % idx, ACCENT2),
-            c("[%s]" % cr.get("service"), DIM), name,
+            c("%-9s" % ("[%s]" % cr.get("service")), DIM),
+            printable(creator_label(cr) or "?")[:40],
             c("id=%s" % cr.get("id"), DIM),
             c("fav=%s" % cr.get("favorited"), DIM),
             c("upd=%s" % fmt_ts(cr.get("updated")), DIM)))
     print("")
-    raw = ask("number(s) to open (e.g. 2 or 1-3), blank=back")
-    if not raw:
-        return
-    try:
-        picks = parse_selection(raw, len(results))
-    except ValueError as e:
-        warn(e)
-        return
+    if len(results) >= 60:
+        info("showing the first 60 matches - refine the search to see others")
+    while True:
+        raw = ask("number(s) to open (e.g. 2 or 1-3), blank=back")
+        if not raw:
+            return True
+        try:
+            picks = parse_selection(raw, len(results))
+            break
+        except ValueError as e:
+            warn(e)
     for idx in picks:
-        creator_menu(cfg, api, cache, dl, results[idx])
+        creator_menu(cfg, api, dl, results[idx])
+    return True
 
 
-def creator_menu(cfg, api, cache, dl, creator):
-    cname = creator.get("name") or creator.get("public_id") or creator["id"]
+def creator_menu(cfg, api, dl, creator):
+    cname = creator_label(creator) or str(creator["id"])
     service = creator["service"]
     uid = creator["id"]
-    name_map = {str(uid): cname}
+    name_map = {(service, str(uid)): cname}
+
+    def fetch(offset):
+        return api.creator_posts(service, uid, offset=offset)
+
+    browse_posts(
+        "%s - %s (id %s)" % (service, printable(cname), uid), fetch,
+        CREATOR_PAGE, "download ALL posts of this creator",
+        lambda picks: download_posts(cfg, api, dl, picks, name_map),
+        lambda page: download_creator(cfg, api, dl, service, uid, cname))
+
+
+def browse_posts(title, fetch, step, all_label, on_pick, on_all):
+    """Paged post list shared by the creator and search menus."""
     offset = 0
+    page = None
     while True:
-        head("%s - %s (id %s)" % (service, cname, uid))
-        info("showing posts from offset %d (50 per page)" % offset)
-        try:
-            posts = api.creator_posts(service, uid, offset=offset)
-        except HttpError as e:
-            warn("could not list posts: %s" % e)
-            return
-        if not posts:
-            if offset == 0:
-                warn("this creator has no visible posts")
-                return
-            warn("no more posts at this offset")
-            offset -= CREATOR_PAGE
-            continue
+        if page is None:
+            try:
+                page = fetch(offset)
+            except HttpError as e:
+                warn("could not list posts: %s" % e)
+                if offset == 0:
+                    pause()
+                    return
+                page = []
+            if not page:
+                if offset == 0:
+                    warn("no posts found")
+                    pause()
+                    return
+                warn("no more posts at this offset")
+                offset = max(0, offset - step)
+                page = None
+                pause()
+                continue
+        head(title)
+        info("%d posts from offset %d" % (len(page), offset))
         print("")
-        for i, p in enumerate(posts, 1):
-            display_post_row(i, p, name_map)
+        for i, p in enumerate(page, 1):
+            display_post_row(i, p)
         print("")
-        print("  %s next page   %s prev page   %s download ALL posts of this creator"
-              % (c("[n]", ACCENT2), c("[p]", ACCENT2), c("[a]", ACCENT2)))
+        print("  %s next page   %s prev page   %s %s"
+              % (c("[n]", ACCENT2), c("[p]", ACCENT2), c("[a]", ACCENT2),
+                 all_label))
         raw = ask("pick number(s) (e.g. 1,3-5) | n | p | a | q=menu")
         if not raw or raw.lower() == "q":
             return
         low = raw.lower()
         if low == "n":
-            offset += CREATOR_PAGE
-            continue
-        if low == "p":
-            offset = max(0, offset - CREATOR_PAGE)
-            continue
-        if low == "a":
-            download_creator(cfg, api, dl, service, uid, cname)
-            continue
-        try:
-            picks = parse_selection(raw, len(posts))
-        except ValueError as e:
-            warn(e)
-            continue
-        download_posts(cfg, api, dl, [posts[i] for i in picks], name_map)
+            offset += step
+            page = None
+        elif low == "p":
+            offset = max(0, offset - step)
+            page = None
+        elif low == "a":
+            on_all(page)
+            pause()
+        else:
+            try:
+                picks = parse_selection(raw, len(page))
+            except ValueError as e:
+                warn(e)
+                continue
+            on_pick([page[i] for i in picks])
+            pause()
 
 
 def download_creator(cfg, api, dl, service, uid, cname=None):
     """Fetch every page of a creator's posts and download all files."""
-    limit_raw = ask("max posts to archive (blank = all)")
     limit = None
-    if limit_raw:
-        try:
-            limit = max(1, int(limit_raw))
-        except ValueError:
-            warn("not a number - archiving all posts")
-    if ask("confirm archive of %s/%s" % (service, uid),
-           default="n").lower() not in ("y", "yes"):
+    while True:
+        limit_raw = ask("max posts to archive (blank = all)")
+        if not limit_raw:
+            break
+        # never fall back to "all" on a typo
+        if limit_raw.isdecimal() and int(limit_raw) > 0:
+            limit = int(limit_raw)
+            break
+        warn("enter a positive number, or leave blank for all")
+    if ask("confirm archive of %s/%s (%s)" % (
+            service, uid, "first %d posts" % limit if limit else "all posts"),
+            default="n").lower() not in ("y", "yes"):
         return
-    name_map = {str(uid): cname} if cname else {}
-    posts = []
+    name_map = {(service, str(uid)): cname} if cname else {}
+    posts, seen = [], set()
     offset = 0
     while True:
         try:
             page = api.creator_posts(service, uid, offset=offset)
         except HttpError as e:
-            warn("stopped: %s" % e)
+            warn("listing stopped early, the archive will be incomplete: %s"
+                 % e)
             break
-        if not page:
+        # new posts shift the pages, so drop repeats; a page with nothing
+        # new also ends the loop
+        fresh = [p for p in page or [] if str(p.get("id")) not in seen]
+        if not fresh:
             break
-        for p in page:
-            name_map.setdefault(str(p.get("user")),
-                                cname or p.get("user"))
-        posts.extend(page)
+        seen.update(str(p.get("id")) for p in fresh)
+        posts.extend(fresh)
         offset += CREATOR_PAGE
         if limit and len(posts) >= limit:
             posts = posts[:limit]
@@ -1103,57 +1359,25 @@ def download_creator(cfg, api, dl, service, uid, cname=None):
     if not posts:
         warn("no posts found for %s/%s" % (service, uid))
         return
-    info("%d posts queued - full post data will be fetched one by one" %
-         len(posts))
+    info("%d posts queued" % len(posts))
     download_posts(cfg, api, dl, posts, name_map)
 
 
 # --- 2. recent / search -----------------------------------------------------
 
-def recent_search_menu(cfg, api, cache, dl):
+def recent_search_menu(cfg, api, dl):
     head("recent posts / global search")
     query = ask("search query (blank = recent posts)")
-    offset = 0
-    while True:
-        try:
-            posts = api.recent_or_search(query or None, offset)
-        except HttpError as e:
-            warn("could not list posts: %s" % e)
-            return
-        if not posts:
-            if offset == 0:
-                warn("no posts found")
-                return
-            warn("no more posts at this offset")
-            offset -= RECENT_PAGE
-            continue
-        info("%d posts (offset %d). %s" % (len(posts), offset,
-             "search=%r" % query if query else "recent"))
-        print("")
-        for i, p in enumerate(posts, 1):
-            display_post_row(i, p)
-        print("")
-        print("  %s next page   %s prev page   %s download ALL on this page"
-              % (c("[n]", ACCENT2), c("[p]", ACCENT2), c("[a]", ACCENT2)))
-        raw = ask("pick number(s) (e.g. 1,3-5) | n | p | a | q=menu")
-        if not raw or raw.lower() == "q":
-            return
-        low = raw.lower()
-        if low == "n":
-            offset += RECENT_PAGE
-            continue
-        if low == "p":
-            offset = max(0, offset - RECENT_PAGE)
-            continue
-        if low == "a":
-            download_posts(cfg, api, dl, list(posts))
-            continue
-        try:
-            picks = parse_selection(raw, len(posts))
-        except ValueError as e:
-            warn(e)
-            continue
-        download_posts(cfg, api, dl, [posts[i] for i in picks])
+
+    def fetch(offset):
+        return api.recent_or_search(query or None, offset)
+
+    browse_posts(
+        "search: %s" % query if query else "recent posts", fetch, RECENT_PAGE,
+        "download ALL on this page",
+        lambda picks: download_posts(cfg, api, dl, picks),
+        lambda page: download_posts(cfg, api, dl, list(page)))
+    return True
 
 
 # --- 3. single post ---------------------------------------------------------
@@ -1172,15 +1396,15 @@ def single_post_menu(cfg, api, dl):
     except HttpError as e:
         warn("could not fetch post: %s" % e)
         return
-    info('fetched: "%s" (%s, %s)' % (post.get("title"), service,
+    info('fetched: "%s" (%s, %s)' % (printable(post.get("title")), service,
                                      post.get("published")))
-    files = collect_post_files(post)
+    files = post_files(cfg, post)
     info("%d downloadable file(s), %d chars of text" %
          (len(files), len(html_to_text(post.get("content")))))
     if ask("download to %s?" % cfg["download_dir"], default="y").lower() \
             not in ("y", "yes"):
         return
-    download_posts(cfg, api, dl, [post])
+    download_posts(cfg, api, dl, [dict(post, _full=True)])
 
 
 # --- 4. whole creator by hand ----------------------------------------------
@@ -1191,7 +1415,7 @@ def quick_creator_menu(cfg, api, dl):
               "'service id' (e.g. patreon 436247)")
     if not raw:
         return
-    m = re.search(r"([a-z]+)/user/(\w+)", raw.strip())
+    m = re.search(r"([a-z]+)/user/([^/?#\s]+)", raw.strip())
     if m:
         service, uid = m.group(1), m.group(2)
     else:
@@ -1201,22 +1425,23 @@ def quick_creator_menu(cfg, api, dl):
         else:
             warn("could not parse input")
             return
-    cname = None
-    try:
-        cache_match = None
-        for c in CreatorCache(cfg, api).get():
-            if c.get("service") == service and str(c.get("id")) == str(uid):
-                cache_match = c.get("name")
-                break
-        if cache_match:
-            cname = cache_match
-            info("creator: %s" % cname)
-    except HttpError:
-        pass
+    key = (service, str(uid))
+    cname = resolve_creator_names(
+        CreatorCache(cfg, api), [{"service": service, "user": uid}]).get(key)
+    if cname:
+        info("creator: %s" % printable(cname))
     download_creator(cfg, api, dl, service, uid, cname)
 
 
 # --- 5. settings ------------------------------------------------------------
+
+def valid_user_agent(ua):
+    """HTTP headers must be plain printable ASCII."""
+    if all(32 <= ord(ch) < 127 for ch in ua):
+        return True
+    warn("the User-Agent may only contain plain ASCII characters")
+    return False
+
 
 def settings_menu(cfg, api):
     while True:
@@ -1237,7 +1462,7 @@ def settings_menu(cfg, api):
         if choice == "1":
             ua = ask("new User-Agent (include a contact, e.g. "
                      "'my-archiver/1.0 (personal backup; contact: you@example.com)')")
-            if ua:
+            if ua and valid_user_agent(ua):
                 cfg["user_agent"] = ua
         elif choice == "2":
             d = ask("download folder")
@@ -1259,10 +1484,14 @@ def settings_menu(cfg, api):
                 CreatorCache(cfg, api).get(force=True)
             except HttpError as e:
                 warn("refresh failed: %s" % e)
+            pause()
         elif choice in ("0", "", None):
-            save_config(cfg)
             return
-        save_config(cfg)
+        try:
+            save_config(cfg)
+        except OSError as e:
+            warn("could not save settings: %s" % e)
+            pause()
 
 
 def first_run_setup(cfg):
@@ -1274,16 +1503,21 @@ def first_run_setup(cfg):
   (not a browser string) plus polite rate limits (1 req/s, max 5 downloads).
   This script enforces those limits. Please enter a contact identifier,
   for example:  pawdl/1.0 (myname@example.com)""")
-    ua = ask("User-Agent")
-    if not ua:
-        ua = "my-archiver/1.0 (personal backup; contact: you@example.com)"
-        warn("no contact given - using %r; downloads may be blocked" % ua)
+    while True:
+        ua = ask("User-Agent")
+        if not ua:
+            return cfg           # main() explains and exits; nothing saved
+        if valid_user_agent(ua):
+            break
     cfg["user_agent"] = ua
     d = ask("download folder", cfg["download_dir"])
     cfg["download_dir"] = os.path.abspath(os.path.expanduser(d or
                                               cfg["download_dir"]))
-    save_config(cfg)
-    info("config saved to %s" % CONFIG_FILE)
+    try:
+        save_config(cfg)
+        info("config saved to %s" % CONFIG_FILE)
+    except OSError as e:
+        warn("could not save config: %s" % e)
     return cfg
 
 
@@ -1292,26 +1526,33 @@ def first_run_setup(cfg):
 # ---------------------------------------------------------------------------
 
 def main():
+    # never crash on a title the console encoding cannot represent
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     cfg = load_config()
+    if "you@example.com" in cfg["user_agent"]:
+        cfg["user_agent"] = ""   # placeholder saved by earlier versions
     cfg = first_run_setup(cfg)
     if not cfg["user_agent"]:
-        warn("no User-Agent set - downloads on pawchive will likely fail "
-             "(run Settings to set one)")
+        warn("a User-Agent with contact info is required - "
+             "run pawdl again to enter one")
         return 1
 
     http = HttpClient(cfg["user_agent"], cfg.get("max_retries",
                                                  DEFAULT_MAX_RETRIES))
     api = PawchiveAPI(http)
     cache = CreatorCache(cfg, api)
-    dl = Downloader(http, DownloadStats())
+    dl = Downloader(http)
 
     while True:
         cls()
         print("")
         banner_box([
-            c("pawdl", "1;96") + c("  \u2502  ", DIM)
+            c("pawdl", "1;96") + c("  %s  " % R_MID, DIM)
             + c("pawchive.pw interactive downloader", "1;97"),
-            c("max 5 parallel \u00b7 1 req/s \u00b7 skip existing \u00b7 retry+backoff", DIM),
+            c((" %s " % SYM_DOT).join((
+                "max 5 parallel", "1 req/s", "skip existing",
+                "retry+backoff")), DIM),
         ])
         print("")
         for key, label in (
@@ -1327,30 +1568,43 @@ def main():
         print("  %s %s" % (c("UA", DIM), c(cfg["user_agent"], DIM)))
         print("  %s %s" % (c("dir", DIM), c(cfg["download_dir"], DIM)))
         choice = ask("menu")
+        if choice in ("0", "", None):
+            print(c("bye", DIM))
+            return 0
+        # menus return True when they need no "press Enter" before the
+        # screen is cleared
+        quiet = False
         try:
             if choice == "1":
-                search_creators_menu(cfg, api, cache, dl)
+                quiet = search_creators_menu(cfg, api, cache, dl)
             elif choice == "2":
-                recent_search_menu(cfg, api, cache, dl)
+                quiet = recent_search_menu(cfg, api, dl)
             elif choice == "3":
                 single_post_menu(cfg, api, dl)
             elif choice == "4":
                 quick_creator_menu(cfg, api, dl)
             elif choice == "5":
                 settings_menu(cfg, api)
+                quiet = True
             elif choice == "6":
                 head("help")
                 print(HELP_TEXT)
-            elif choice in ("0", "", None):
-                print(c("bye", DIM))
-                return 0
+            else:
+                warn("unknown menu choice: %s" % choice)
         except KeyboardInterrupt:
             print("")
             warn("interrupted - returning to menu")
         except HttpError as e:
             print("")
             warn("API error: %s" % e)
-    return 0
+        except OSError as e:
+            print("")
+            warn("file error: %s" % e)
+        if not quiet:
+            try:
+                pause()
+            except KeyboardInterrupt:
+                print("")
 
 
 if __name__ == "__main__":
@@ -1359,4 +1613,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("")
         sys.exit(130)
-
