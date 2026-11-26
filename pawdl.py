@@ -8,6 +8,8 @@ Built against the public API (https://pawchive.pw/api/schema):
   GET /api/v1/posts?o=<150*n>&q=<query>         recent posts / global search
   GET /api/v1/{service}/user/{id}/posts?o=<50*n>&q=<query>   posts of one creator
   GET /api/v1/{service}/user/{id}/post/{pid}    full single post
+  GET /api/v1/account/favorites                 your favourites (needs the
+                                                "session" cookie)
 
 Files are served from  {server}/data{path}?f={name}  (n1..n3.pawchive.pw).
 The file server requires download etiquette:
@@ -21,6 +23,7 @@ Python 3.8+, standard library only.
 
 import concurrent.futures
 import datetime
+import getpass
 import html as htmllib
 import http.client
 import json
@@ -49,6 +52,8 @@ FILE_MIN_INTERVAL = 1.05   # etiquette: >= 1 request/second on file servers
 API_MIN_INTERVAL = 0.30    # be gentle with the API as well
 
 DEFAULT_MAX_RETRIES = 4
+DEFAULT_USER_AGENT = ("my-archiver/1.0 (personal backup; "
+                      "contact: you@example.com)")
 RETRY_BACKOFF = [5, 15, 40]  # seconds between retries
 
 
@@ -67,7 +72,8 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 CREATORS_CACHE = os.path.join(CONFIG_DIR, "creators_cache.json")
 
 DEFAULT_CONFIG = {
-    "user_agent": "",
+    "user_agent": DEFAULT_USER_AGENT,
+    "session_cookie": "",
     "download_dir": os.path.join(os.getcwd(), "pawdl_downloads"),
     "creators_cache_hours": 24,
     "save_post_json": True,
@@ -94,22 +100,28 @@ def load_config():
             cfg[key] = max(minimum, int(cfg[key]))
         except (TypeError, ValueError):
             cfg[key] = DEFAULT_CONFIG[key]
-    for key in ("user_agent", "download_dir"):
+    for key in ("user_agent", "download_dir", "session_cookie"):
         if not isinstance(cfg[key], str):
             cfg[key] = DEFAULT_CONFIG[key]
+    if not cfg["user_agent"].strip():
+        cfg["user_agent"] = DEFAULT_USER_AGENT
     return cfg
 
 
-def write_json_atomic(path, data, indent=None):
+def write_json_atomic(path, data, indent=None, mode=0o666):
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with open(fd, "w", encoding="utf-8") as fh:
+        if mode != 0o666 and os.name != "nt":
+            os.chmod(tmp, mode)   # a leftover tmp file keeps its old mode
         json.dump(data, fh, indent=indent, ensure_ascii=False)
     os.replace(tmp, path)
 
 
 def save_config(cfg):
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    write_json_atomic(CONFIG_FILE, cfg, indent=2)
+    # owner-only: the file may hold your session cookie
+    write_json_atomic(CONFIG_FILE, cfg, indent=2, mode=0o600)
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +395,18 @@ class HttpError(Exception):
     pass
 
 
+class AuthError(HttpError):
+    """The session cookie was not accepted."""
+    pass
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Used for logged-in requests: the cookie must never follow a redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class DownloadCancelled(Exception):
     """Raised via the progress callback to abort a running download."""
     pass
@@ -408,14 +432,19 @@ class HttpClient:
             return RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)] + 15
         return RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
 
-    def get_json(self, url, limiter, limit=None):
-        """GET a URL, parse JSON. Returns (data, final_url)."""
+    def get_json(self, url, limiter, limit=None, session=None):
+        """GET a URL, parse JSON. Returns (data, final_url).
+        Pass `session` only for account endpoints on the API host."""
         last_err = None
         for attempt in range(self.max_retries + 1):
             limiter.wait()
             req = urllib.request.Request(url, headers=self._opener_headers())
+            opener = urllib.request.urlopen
+            if session:
+                req.add_unredirected_header("Cookie", "session=%s" % session)
+                opener = urllib.request.build_opener(_NoRedirect).open
             try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
+                with opener(req, timeout=60) as resp:
                     raw = resp.read(limit) if limit else resp.read()
                 return json.loads(raw.decode("utf-8", "replace")), url
             except urllib.error.HTTPError as e:
@@ -424,6 +453,9 @@ class HttpClient:
                     body = e.read().decode("utf-8", "replace")[:300]
                 except Exception:
                     pass
+                if session and (e.code == 401 or 300 <= e.code < 400):
+                    raise AuthError("not logged in (HTTP %s) - the session "
+                                    "cookie is wrong or expired" % e.code)
                 if not self._should_retry(e.code):
                     raise HttpError("HTTP %s: %s" % (e.code, body.strip()))
                 last_err = HttpError("HTTP %s: %s" % (e.code, body.strip()))
@@ -528,9 +560,89 @@ class HttpClient:
 # pawchive API wrapper
 # ---------------------------------------------------------------------------
 
+def clean_session_cookie(text):
+    """Accept 'abc', 'session=abc' or a whole 'Cookie: a=1; session=abc'
+    header. Returns the bare value, or None if it is not usable."""
+    text = (text or "").strip().strip("\"'")
+    text = re.sub(r"(?i)^cookie:\s*", "", text)
+    m = re.search(r"(?:^|;)\s*session=([^;]*)", text)
+    if m:
+        text = m.group(1).strip().strip("\"'")
+    elif ";" in text or re.match(r"^[\w-]+=[^=]", text):
+        return None              # some other cookie
+    if not text or any(not 33 <= ord(ch) < 127 for ch in text):
+        return None
+    return text
+
+
+def parse_favorite(item):
+    """Classify one favourite entry. Returns (is_post, dict) or None."""
+    if not isinstance(item, dict):
+        return None
+    for wrapper in ("post", "creator", "artist"):
+        if isinstance(item.get(wrapper), dict):   # {"post": {...}, ...}
+            outer = {k: v for k, v in item.items() if k != wrapper}
+            item = dict(outer, **item[wrapper])
+            break
+    user = item.get("user") or item.get("creator_id")
+    is_post = bool(user) or "title" in item
+    pid = (item.get("post_id") if is_post else None) or item.get("id")
+    if not item.get("service") or not pid or (is_post and not user):
+        return None
+    fav = dict(item, id=pid)
+    if is_post:
+        fav["user"] = user
+    return is_post, fav
+
+
 class PawchiveAPI:
-    def __init__(self, http):
+    def __init__(self, http, session=None):
         self.http = http
+        self.session = session   # value of the "session" cookie, if any
+
+    def favorites(self):
+        """Return (creators, posts) favourited by the logged-in account."""
+        if not self.session:
+            raise AuthError("no session cookie set")
+        creators, posts, unknown = {}, {}, None
+        # the list form returns one kind per request, selected by ?type=
+        for kind in ("artist", "post"):
+            data, _ = self.http.get_json(
+                "%s/account/favorites?type=%s" % (API_BASE, kind),
+                self.http.api_limiter, session=self.session)
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict) and ("creators" in data
+                                             or "posts" in data):
+                items = (data.get("creators") or []) + (data.get("posts") or [])
+            else:
+                shape = (", ".join(sorted(map(str, data)))
+                         if isinstance(data, dict) else type(data).__name__)
+                raise HttpError("unexpected favourites format (got: %s)"
+                                % shape)
+            for item in items:
+                entry = parse_favorite(item)
+                if entry is None:
+                    unknown = item
+                    continue
+                is_post, fav = entry
+                key = (fav["service"], str(fav.get("user")), str(fav["id"]))
+                (posts if is_post else creators)[key] = fav
+        if unknown is not None and not creators and not posts:
+            # field names only, so the message is safe to share
+            shape = (", ".join(sorted(map(str, unknown)))
+                     if isinstance(unknown, dict) else type(unknown).__name__)
+            raise HttpError("unrecognised favourite entries (fields: %s)"
+                            % shape)
+
+        def newest_first(items):
+            def key(x):
+                seq = str(x.get("faved_seq") or "")
+                return (str(x.get("favorited_at") or ""),
+                        int(seq) if seq.isdecimal() else 0)
+            return sorted(items, key=key, reverse=True)
+
+        return newest_first(creators.values()), newest_first(posts.values())
 
     def creators(self):
         data, _ = self.http.get_json(API_BASE + "/creators",
@@ -1082,6 +1194,12 @@ HELP_TEXT = """
                                 and archive every post and file.
     [5] Settings              - User-Agent contact, download folder, toggles.
     [6] Help                  - this text.
+    [7] My favourites         - browse and download the creators and posts you
+                                favourited on the site. Needs the value of
+                                your "session" cookie (browser developer tools
+                                > Cookies > pawchive.pw). It is only sent to
+                                the pawchive.pw API, never to file servers,
+                                and is saved only if you say so.
 
   Download behaviour (enforced by default):
     * max 5 parallel downloads, >= 1 second between file requests
@@ -1115,12 +1233,15 @@ def display_post_row(i, p):
         if key:
             paths.add(key)
     date = str(p.get("published") or "")[:10]
+    details = date or "?"
+    if "file" in p or "attachments" in p:
+        details += " | %d file(s)" % len(paths)
     print("  %s %s %s  %s  %s" % (
         c("%3d." % i, ACCENT2),
         c("[%s]" % p.get("service", "?"), DIM),
         c(str(p.get("user", "?")), DIM),
         title,
-        c("%s | %d file(s)" % (date or "?", len(paths)), ACCENT)))
+        c(details, ACCENT)))
 
 
 def creator_key(item, user_field="user"):
@@ -1433,6 +1554,153 @@ def quick_creator_menu(cfg, api, dl):
     download_creator(cfg, api, dl, service, uid, cname)
 
 
+# --- session cookie / favourites --------------------------------------------
+
+def store_cookie(cfg, api, value, remember):
+    api.session = value or None
+    cfg["session_cookie"] = value if value and remember else ""
+    try:
+        save_config(cfg)
+    except OSError as e:
+        warn("could not save settings: %s" % e)
+
+
+def enter_cookie(cfg, api):
+    """Prompt for the session cookie (hidden). Returns True if one was set."""
+    print("""
+  Log in at pawchive.pw in your browser, open the developer tools (F12),
+  go to Storage (Firefox) or Application (Chrome) > Cookies, and copy the
+  value of the "session" cookie. Treat it like a password.
+  Your input stays hidden while you paste.""")
+    while True:
+        try:
+            raw = getpass.getpass("  %s %s " % (
+                c("?", ACCENT2),
+                c("session cookie (blank = cancel)", PROMPT))).strip()
+        except EOFError:
+            return False
+        if not raw:
+            return False
+        value = clean_session_cookie(raw)
+        if value:
+            break
+        warn("that does not look like a session cookie value")
+    remember = (ask("save it on this computer? y/n", default="n")
+                or "").lower() in ("y", "yes")
+    store_cookie(cfg, api, value, remember)
+    if remember:
+        info("saved in plain text in %s" % CONFIG_FILE)
+    else:
+        info("kept for this run only")
+    return True
+
+
+def cookie_status(cfg, api):
+    if not api.session:
+        return c("not set", BAD)
+    if cfg.get("session_cookie") == api.session:
+        return c("saved", GOOD)
+    return c("this run only", GOOD)
+
+
+FAVORITES_PAGE = 50
+
+
+def favorite_creators_menu(cfg, api, dl, creators):
+    offset = 0
+    while True:
+        page = creators[offset:offset + FAVORITES_PAGE]
+        head("favourite creators")
+        info("%d-%d of %d" % (offset + 1, offset + len(page), len(creators)))
+        print("")
+        for i, cr in enumerate(page, 1):
+            print("  %s %s %-40s %s" % (
+                c("%3d." % i, ACCENT2),
+                c("%-9s" % ("[%s]" % cr.get("service")), DIM),
+                printable(creator_label(cr) or "?")[:40],
+                c("id=%s" % cr.get("id"), DIM)))
+        print("")
+        print("  %s next page   %s prev page"
+              % (c("[n]", ACCENT2), c("[p]", ACCENT2)))
+        raw = ask("number(s) to open | n | p | q=back")
+        if not raw or raw.lower() == "q":
+            return
+        low = raw.lower()
+        if low == "n":
+            if offset + FAVORITES_PAGE < len(creators):
+                offset += FAVORITES_PAGE
+        elif low == "p":
+            offset = max(0, offset - FAVORITES_PAGE)
+        else:
+            try:
+                picks = parse_selection(raw, len(page))
+            except ValueError as e:
+                warn(e)
+                continue
+            for idx in picks:
+                creator_menu(cfg, api, dl, page[idx])
+
+
+def favorite_posts_menu(cfg, api, dl, posts):
+    browse_posts(
+        "favourite posts",
+        lambda offset: posts[offset:offset + FAVORITES_PAGE],
+        FAVORITES_PAGE, "download ALL on this page",
+        lambda picks: download_posts(cfg, api, dl, picks),
+        lambda page: download_posts(cfg, api, dl, list(page)))
+
+
+def favorites_menu(cfg, api, dl):
+    head("my favourites")
+    if not api.session and not enter_cookie(cfg, api):
+        return True
+    favs = None
+    while True:
+        if favs is None:
+            try:
+                favs = api.favorites()
+            except AuthError as e:
+                warn(e)
+                if enter_cookie(cfg, api):
+                    continue
+                return True
+            except HttpError as e:
+                warn("could not load favourites: %s" % e)
+                pause()
+                return True
+        creators, posts = favs
+        head("my favourites")
+        for key, label in (
+                ("1", "Favourite creators (%d)" % len(creators)),
+                ("2", "Favourite posts (%d)" % len(posts)),
+                ("3", "Reload"),
+                ("4", "Change session cookie"),
+                ("5", "Forget session cookie"),
+                ("0", "Back")):
+            print("  %s %s" % (c("[%s]" % key, ACCENT2), label))
+        choice = ask("favourites")
+        if choice in ("0", "q", "", None):
+            return True
+        if choice == "1" and creators:
+            favorite_creators_menu(cfg, api, dl, creators)
+        elif choice == "2" and posts:
+            favorite_posts_menu(cfg, api, dl, posts)
+        elif choice in ("1", "2"):
+            warn("nothing there yet")
+        elif choice == "3":
+            favs = None
+        elif choice == "4":
+            if enter_cookie(cfg, api):
+                favs = None
+        elif choice == "5":
+            store_cookie(cfg, api, "", False)
+            ok("session cookie removed")
+            pause()
+            return True
+        else:
+            warn("unknown choice: %s" % choice)
+
+
 # --- 5. settings ------------------------------------------------------------
 
 def valid_user_agent(ua):
@@ -1454,7 +1722,8 @@ def settings_menu(cfg, api):
                 ("5", "save content.txt", onoff(cfg["save_content_txt"])),
                 ("6", "save post.md", onoff(cfg["save_post_md"])),
                 ("7", "inline images", onoff(cfg["download_inline_images"])),
-                ("8", "preview thumbnails", onoff(cfg["download_preview_files"]))):
+                ("8", "preview thumbnails", onoff(cfg["download_preview_files"])),
+                ("s", "session cookie", cookie_status(cfg, api))):
             print("  %s %-20s: %s" % (c("[%s]" % key, ACCENT2), label, val))
         print("  %s %-20s" % (c("[9]", ACCENT2), "refresh creator cache now"))
         print("  %s %-20s" % (c("[0]", ACCENT2), "back"))
@@ -1479,6 +1748,12 @@ def settings_menu(cfg, api):
                     "6": "save_post_md", "7": "download_inline_images",
                     "8": "download_preview_files"}
             cfg[keys[choice]] = not cfg[keys[choice]]
+        elif (choice or "").lower() == "s":
+            if api.session and (ask("remove the current cookie? y/n",
+                                    default="n") or "").lower() in ("y", "yes"):
+                store_cookie(cfg, api, "", False)
+            else:
+                enter_cookie(cfg, api)
         elif choice == "9":
             try:
                 CreatorCache(cfg, api).get(force=True)
@@ -1495,18 +1770,16 @@ def settings_menu(cfg, api):
 
 
 def first_run_setup(cfg):
-    if cfg["user_agent"]:
+    if os.path.exists(CONFIG_FILE):
         return cfg
     print("")
     head("first-run setup")
     print("""  The pawchive file server requires an *identifiable* User-Agent
   (not a browser string) plus polite rate limits (1 req/s, max 5 downloads).
-  This script enforces those limits. Please enter a contact identifier,
-  for example:  pawdl/1.0 (myname@example.com)""")
+  This script enforces those limits. Press Enter to use the default, or
+  type your own with a contact, e.g.  pawdl/1.0 (myname@example.com)""")
     while True:
-        ua = ask("User-Agent")
-        if not ua:
-            return cfg           # main() explains and exits; nothing saved
+        ua = ask("User-Agent", cfg["user_agent"]) or cfg["user_agent"]
         if valid_user_agent(ua):
             break
     cfg["user_agent"] = ua
@@ -1530,17 +1803,11 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
     cfg = load_config()
-    if "you@example.com" in cfg["user_agent"]:
-        cfg["user_agent"] = ""   # placeholder saved by earlier versions
     cfg = first_run_setup(cfg)
-    if not cfg["user_agent"]:
-        warn("a User-Agent with contact info is required - "
-             "run pawdl again to enter one")
-        return 1
-
     http = HttpClient(cfg["user_agent"], cfg.get("max_retries",
                                                  DEFAULT_MAX_RETRIES))
-    api = PawchiveAPI(http)
+    api = PawchiveAPI(http,
+                      clean_session_cookie(cfg.get("session_cookie")))
     cache = CreatorCache(cfg, api)
     dl = Downloader(http)
 
@@ -1562,6 +1829,7 @@ def main():
                 ("4", "Download whole creator (URL or 'service id')"),
                 ("5", "Settings"),
                 ("6", "Help"),
+                ("7", "My favourites"),
                 ("0", "Exit")):
             print("  %s %s" % (c("[%s]" % key, ACCENT2), label))
         print("")
@@ -1589,6 +1857,8 @@ def main():
             elif choice == "6":
                 head("help")
                 print(HELP_TEXT)
+            elif choice == "7":
+                quiet = favorites_menu(cfg, api, dl)
             else:
                 warn("unknown menu choice: %s" % choice)
         except KeyboardInterrupt:
